@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Editor/IDE
+.vscode/
+.cache/
+.idea/
+
+# Local tools
+.claude/
+
+# Generated outputs
+result/
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.psd
+*.mp4
+*.mov
+*.wav
+*.mp3
+*.avi
+*.zip
+
+# Adobe Premiere Pro
+Adobe Premiere Pro Auto-Save/
+Adobe Premiere Pro Captured Audio/
+Adobe Premiere Pro Captured Video/
+*.prproj
