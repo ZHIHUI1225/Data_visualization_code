@@ -195,13 +195,19 @@ def simplify_path(path: List[np.ndarray], obstacles_union, bounds: List[float]) 
     simplified = [path[0]]
     i = 0
     while i < len(path) - 1:
+        found = False
         for j in range(len(path) - 1, i, -1):
             if not check_line_collision(path[i], path[j], obstacles_union, bounds):
                 simplified.append(path[j])
                 i = j
+                found = True
                 break
-        else:
+        
+        if not found:
+            # Cannot jump to any point - add next point to maintain continuity
             i += 1
+            if i < len(path):
+                simplified.append(path[i])
 
     return simplified
 

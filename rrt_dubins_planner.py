@@ -539,17 +539,31 @@ class RRTStarDubins:
         执行RRT*规划（返回完整Dubins路径）
 
         Returns:
-            DubinsPath对象 或 None
+            DubinsPath对象 或 None (self.failure_stats 包含失败原因)
         """
         start_time = time.time()
         
-        # 调试统计
+        # 失败原因统计（用于后续分析）
+        self.failure_stats = {
+            'total_iterations': 0,
+            'collision_count': 0,
+            'dubins_fail_count': 0,
+            'nodes_explored': 0,
+            'min_distance_to_goal': float('inf'),
+            'elapsed_time': 0,
+            'reached_goal': False
+        }
+        
         collision_count = 0
         dubins_fail_count = 0
         last_progress_iter = 0
         
         # 自适应目标采样率（随迭代次数增加而提高）
         base_goal_rate = Config.RRT_GOAL_SAMPLE_RATE
+        
+        # 早停机制：找到解后再优化的迭代次数
+        first_solution_iter = None
+        extra_optimization_iters = 5000  # 找到解后再优化5000次迭代
 
         for i in range(max_iter):
             # 自适应提高目标采样率
@@ -632,33 +646,89 @@ class RRTStarDubins:
                         # 更新姿态以匹配新的Dubins路径终点，确保连续性
                         near_node.pose = dubins_rewire.end.copy()
 
-            # 9. 检查是否到达目标（只考虑位置，不考虑方向）
+            # 9. 激进的目标连接策略：每次添加新节点都尝试连接目标
+            # 不依赖距离阈值，而是直接尝试多个目标朝向
             dist_to_goal = np.linalg.norm(new_node.pose[:2] - self.goal.pose[:2])
-            if dist_to_goal < Config.RRT_GOAL_THRESHOLD:
-                # 使用new_node的朝向作为终点朝向（不约束终点方向）
-                goal_pose_relaxed = np.array([self.goal.pose[0], self.goal.pose[1], new_node.pose[2]])
-                dubins_to_goal = compute_dubins_path(new_node.pose, goal_pose_relaxed, self.radius)
+            
+            # 尝试多个目标朝向（8个方向 + 指向新节点的方向）
+            goal_orientations = [
+                0, np.pi/4, np.pi/2, 3*np.pi/4, 
+                np.pi, -3*np.pi/4, -np.pi/2, -np.pi/4,
+                np.arctan2(new_node.pose[1] - self.goal.pose[1], 
+                          new_node.pose[0] - self.goal.pose[0])  # 指向新节点
+            ]
+            
+            best_goal_path = None
+            best_goal_cost = float('inf')
+            
+            for goal_theta in goal_orientations:
+                goal_pose_candidate = np.array([self.goal.pose[0], self.goal.pose[1], goal_theta])
+                dubins_to_goal = compute_dubins_path(new_node.pose, goal_pose_candidate, self.radius)
+                
                 if dubins_to_goal is not None:
+                    # 检查碰撞
                     if not check_dubins_collision(dubins_to_goal, self.obstacles, bounds=self.bounds):
-                        # 更新goal节点的实际到达姿态为Dubins路径的精确终点
-                        self.goal.pose = dubins_to_goal.end.copy()
-                        self.goal.parent = new_node
-                        self.goal.cost = new_node.cost + dubins_to_goal.total_length
-                        self.goal_node = self.goal
+                        candidate_cost = new_node.cost + dubins_to_goal.total_length
+                        # 选择代价最小的路径
+                        if candidate_cost < best_goal_cost:
+                            best_goal_cost = candidate_cost
+                            best_goal_path = dubins_to_goal
+            
+            # 如果找到可行路径，且优于当前最优解（如果有）
+            if best_goal_path is not None:
+                if self.goal_node is None or best_goal_cost < self.goal.cost:
+                    # 更新目标节点
+                    self.goal.pose = best_goal_path.end.copy()
+                    self.goal.parent = new_node
+                    self.goal.cost = best_goal_cost
+                    self.goal_node = self.goal
+                    
+                    # 记录第一次找到解的迭代次数
+                    if first_solution_iter is None:
+                        first_solution_iter = i
 
-                        if verbose:
-                            elapsed = time.time() - start_time
-                            print(f"  [OK] RRT*-Dubins 找到路径: {i+1} 次迭代, {elapsed:.2f}秒, "
-                                  f"代价={self.goal.cost:.3f}m")
-                            print(f"       起点: ({self.start.pose[0]:.3f}, {self.start.pose[1]:.3f}, {np.rad2deg(self.start.pose[2]):.1f}°)")
-                            print(f"       终点: ({self.goal.pose[0]:.3f}, {self.goal.pose[1]:.3f}, {np.rad2deg(self.goal.pose[2]):.1f}°)")
+                    if verbose:
+                        elapsed = time.time() - start_time
+                        print(f"  [OK] RRT*-Dubins 找到路径: {i+1} 次迭代, {elapsed:.2f}秒, "
+                              f"代价={self.goal.cost:.3f}m (dist={dist_to_goal:.4f}m)")
+                        print(f"       起点: ({self.start.pose[0]:.3f}, {self.start.pose[1]:.3f}, {np.rad2deg(self.start.pose[2]):.1f}°)")
+                        print(f"       终点: ({self.goal.pose[0]:.3f}, {self.goal.pose[1]:.3f}, {np.rad2deg(self.goal.pose[2]):.1f}°)")
+                    
+                    # 找到第一个可行解后，继续优化更多迭代
+                    # 不立即返回，让RRT*继续寻找更优路径
+            
+            # 早停检查：如果找到解并且已经优化了足够多次
+            if first_solution_iter is not None and (i - first_solution_iter) >= extra_optimization_iters:
+                if verbose:
+                    elapsed = time.time() - start_time
+                    print(f"  [OK] 早停：已优化 {i - first_solution_iter} 次迭代，总耗时{elapsed:.2f}秒")
+                return self._extract_full_path()
 
-                        return self._extract_full_path()
-
+        # 迭代结束，检查是否找到了解
+        if self.goal_node is not None:
+            # 找到了解，返回最优路径
+            if verbose:
+                elapsed = time.time() - start_time
+                print(f"  [OK] RRT*-Dubins 完成优化: {max_iter} 次迭代, {elapsed:.2f}秒")
+                print(f"       最终代价: {self.goal.cost:.3f}m")
+            return self._extract_full_path()
+        
+        # 规划失败，记录统计信息
+        min_dist = min(np.linalg.norm(node.pose[:2] - self.goal.pose[:2]) for node in self.nodes) if self.nodes else float('inf')
+        
+        self.failure_stats.update({
+            'total_iterations': max_iter,
+            'collision_count': collision_count,
+            'dubins_fail_count': dubins_fail_count,
+            'nodes_explored': len(self.nodes),
+            'min_distance_to_goal': float(min_dist),
+            'elapsed_time': time.time() - start_time,
+            'reached_goal': False
+        })
+        
         if verbose:
             print(f"  [FAIL] RRT*-Dubins 失败: 达到最大迭代次数 {max_iter}")
             print(f"    统计: {len(self.nodes)} 节点, 碰撞={collision_count}, Dubins失败={dubins_fail_count}")
-            min_dist = min(np.linalg.norm(node.pose[:2] - self.goal.pose[:2]) for node in self.nodes)
             print(f"    最近距离目标: {min_dist:.4f}m (阈值={Config.RRT_GOAL_THRESHOLD}m)")
         return None
 
@@ -1155,13 +1225,17 @@ def process_single_map(env_path: str, output_dir: str, verbose: bool = True) -> 
         initial_heading = np.arctan2(goal_pos[1] - start_pos[1], goal_pos[0] - start_pos[0])
         start_pose_free = np.array([start_pos[0], start_pos[1], initial_heading])
 
-        attempts = 10
+        attempts = 2  # 只尝试2次，降低计算成本
         best_segments = None
         best_cost = float('inf')
         best_rrt = None
         last_rrt = None
+        all_failure_stats = []  # 记录所有尝试的失败统计
 
         for attempt in range(1, attempts + 1):
+            if verbose:
+                print(f"\n  === 尝试 {attempt}/{attempts} ===")
+            
             rrt = RRTStarDubins(
                 start=start_pose_free,
                 goal=env['goal'],
@@ -1172,14 +1246,19 @@ def process_single_map(env_path: str, output_dir: str, verbose: bool = True) -> 
             last_rrt = rrt
 
             candidate_segments = rrt.plan(verbose=verbose)
+            
+            # 收集失败统计
+            if hasattr(rrt, 'failure_stats'):
+                all_failure_stats.append(rrt.failure_stats)
+            
             if candidate_segments is None or len(candidate_segments) == 0:
                 if verbose:
-                    print(f"  [FAIL] 候选路径 {attempt}/{attempts} 失败")
+                    print(f"  [FAIL] 尝试 {attempt}/{attempts} 失败")
                 continue
 
             candidate_cost = sum(seg.total_length for seg in candidate_segments)
             if verbose:
-                print(f"  [OK] 候选路径 {attempt}/{attempts}，长度={candidate_cost:.4f}m")
+                print(f"  [OK] 尝试 {attempt}/{attempts} 成功，路径长度={candidate_cost:.4f}m")
 
             if candidate_cost < best_cost:
                 best_cost = candidate_cost
@@ -1194,7 +1273,51 @@ def process_single_map(env_path: str, output_dir: str, verbose: bool = True) -> 
         map_name = env['map_name']
 
         if dubins_segments is None or len(dubins_segments) == 0:
-            print(f"  [FAIL] RRT*-Dubins 规划失败，保存失败信息...")
+            print(f"\n  [FAIL] RRT*-Dubins 规划失败 ({attempts}次尝试均失败)")
+            
+            # 分析失败原因
+            print(f"\n  {'='*50}")
+            print(f"  失败原因分析")
+            print(f"  {'='*50}")
+            
+            if len(all_failure_stats) > 0:
+                # 汇总统计
+                avg_collisions = np.mean([s['collision_count'] for s in all_failure_stats])
+                avg_dubins_fails = np.mean([s['dubins_fail_count'] for s in all_failure_stats])
+                avg_nodes = np.mean([s['nodes_explored'] for s in all_failure_stats])
+                min_dist_overall = min([s['min_distance_to_goal'] for s in all_failure_stats])
+                
+                print(f"  总尝试次数: {len(all_failure_stats)}")
+                print(f"  平均探索节点: {avg_nodes:.0f} 个")
+                print(f"  平均碰撞次数: {avg_collisions:.0f} (说明障碍物密度高)")
+                print(f"  平均Dubins失败: {avg_dubins_fails:.0f} (几何约束难以满足)")
+                print(f"  最近到达距离: {min_dist_overall:.4f}m (目标阈值={Config.RRT_GOAL_THRESHOLD}m)")
+                
+                # 诊断主要问题
+                collision_ratio = avg_collisions / Config.RRT_MAX_ITER if Config.RRT_MAX_ITER > 0 else 0
+                dubins_ratio = avg_dubins_fails / Config.RRT_MAX_ITER if Config.RRT_MAX_ITER > 0 else 0
+                
+                print(f"\n  主要失败原因:")
+                if collision_ratio > 0.5:
+                    print(f"    ❌ 碰撞率过高 ({collision_ratio*100:.1f}%) - 障碍物太密集或安全边距过大")
+                if dubins_ratio > 0.3:
+                    print(f"    ❌ Dubins计算失败率高 ({dubins_ratio*100:.1f}%) - 转弯半径约束太严格")
+                if min_dist_overall > Config.RRT_GOAL_THRESHOLD * 2:
+                    print(f"    ❌ 无法接近目标 - 目标区域可能被困或阈值太小")
+                if avg_nodes < 100:
+                    print(f"    ❌ 探索节点太少 - 环境探索不充分，需增加迭代次数")
+                    
+                print(f"\n  建议:")
+                if collision_ratio > 0.5:
+                    print(f"    • 减小 OBSTACLE_EXPANSION (当前={Config.OBSTACLE_EXPANSION}m)")
+                if dubins_ratio > 0.3:
+                    print(f"    • 减小 DUBINS_MIN_RADIUS (当前={Config.DUBINS_MIN_RADIUS}m)")
+                if min_dist_overall > Config.RRT_GOAL_THRESHOLD * 2:
+                    print(f"    • 增加 RRT_GOAL_THRESHOLD (当前={Config.RRT_GOAL_THRESHOLD}m)")
+                if avg_nodes < 100:
+                    print(f"    • 增加 RRT_MAX_ITER (当前={Config.RRT_MAX_ITER})")
+            
+            print(f"  {'='*50}\n")
             
             # 保存失败信息
             failure_output = {
@@ -1206,7 +1329,8 @@ def process_single_map(env_path: str, output_dir: str, verbose: bool = True) -> 
                 'goal_pose': env['goal'],
                 'dubins_min_radius': Config.DUBINS_MIN_RADIUS,
                 'max_iterations': Config.RRT_MAX_ITER,
-                'bounds': env['bounds']
+                'bounds': env['bounds'],
+                'failure_statistics': all_failure_stats
             }
             
             failure_json_path = output_path / f'dubins_FAILED_{map_name}.json'
